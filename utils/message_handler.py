@@ -94,7 +94,8 @@ async def handle_messages(ws, state):
                     if isinstance(payload, dict) and "bids" in payload and "asks" in payload:
                         state.update_snapshot({
                             "bids": payload.get("bids", []),
-                            "asks": payload.get("asks", [])
+                            "asks": payload.get("asks", []),
+                            "timestamp": payload.get("timestamp", 0),
                         })
 
                 # Incremental book updates

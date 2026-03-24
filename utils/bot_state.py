@@ -39,6 +39,7 @@ class BotState:
     def update_snapshot(self, snapshot: dict):
         self.book_snapshot["bids"] = snapshot.get("bids", [])
         self.book_snapshot["asks"] = snapshot.get("asks", [])
+        self.book_snapshot["timestamp"] = snapshot.get("timestamp", 0)
 
         bids = self.book_snapshot["bids"]
         asks = self.book_snapshot["asks"]

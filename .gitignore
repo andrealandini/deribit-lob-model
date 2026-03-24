@@ -42,3 +42,6 @@ env/
 .DS_Store
 
 .claude/
+
+
+output/

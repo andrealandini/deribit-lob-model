@@ -1,0 +1,247 @@
+================================================================================
+                         COMPOSITE ALPHA MODEL
+                     Architecture & Design Rationale
+================================================================================
+
+1. OVERVIEW
+--------------------------------------------------------------------------------
+Composite Alpha is an advanced paper-trading strategy that fuses four
+microstructure and stochastic sub-signals into a single directional score,
+gates every entry on a multi-factor confidence check, and wraps every
+position in an asymmetric stop-loss / take-profit bracket where the
+take-profit is always wider than the stop-loss (default 2.5×).
+
+Design philosophy: quality over quantity.
+The model trades infrequently (minimum 30 s between trades) and only when
+multiple independent signals agree and market conditions are favourable.
+
+
+2. SUB-SIGNALS
+--------------------------------------------------------------------------------
+Each sub-signal is normalised to the range [-1, +1].
+
+2.1  LOB Queue Imbalance  (weight 0.25)
+     Source: Cont & de Larrard, "Price Dynamics in a Markovian Limit Order
+             Market", SIAM J. Financial Math, 2013.
+
+     imbalance = best_bid_qty / (best_bid_qty + best_ask_qty)
+
+     If imbalance > 0.60 the bid queue is thicker than the ask queue.
+     This means the ask side is more likely to be consumed first, pushing
+     the price upward.  The signal scales linearly from 0 at 0.60 to +1
+     at 1.0 (and symmetrically for the short side below 0.40).
+
+2.2  Order Flow Imbalance – OFI  (weight 0.30)
+     Source: Cont, Kukanov & Stoikov, "The Price Impact of Order Book
+             Events", J. Financial Econometrics, 2014.
+
+     OFI measures event-by-event changes at the best bid and ask:
+       • If the best bid price rises or bid size grows  → positive OFI
+       • If the best ask price drops or ask size grows  → negative OFI
+
+     The raw OFI is accumulated over a rolling 50-event window and
+     normalised by its empirical standard deviation to produce a z-score.
+     A positive z-score means sustained buy pressure; negative means
+     sustained sell pressure.
+
+     OFI receives the highest weight (0.30) because it captures the
+     *dynamics* of the order book, not just a snapshot.
+
+2.3  Kyle Flow Momentum  (weight 0.20)
+     Source: Kyle, "Continuous Auctions and Insider Trading",
+             Econometrica, 1985.
+
+     Kyle's model relates price changes to aggregate order flow through a
+     price-impact coefficient lambda:
+
+         ΔP ≈ λ · ΔOrderFlow
+
+     The model estimates lambda online via rolling OLS:
+
+         λ̂ = Cov(ΔP, ΔFlow) / Var(ΔFlow)
+
+     over the last 80 book snapshots.  It then computes the predicted
+     price move from the most recent 20-snapshot flow burst:
+
+         predicted_move = λ̂ × recent_net_flow
+
+     and normalises by the current mid-price.  A positive predicted move
+     implies informed buying hasn't been fully priced in yet.
+
+2.4  Ornstein-Uhlenbeck Mean Reversion  (weight 0.25)
+     The mid-price is modelled as a mean-reverting process:
+
+         dX = θ (μ − X) dt + σ dW
+
+     In discrete time:  X_{t+1} = a + b · X_t + ε
+     where  b = exp(−θ Δt)  and  a = μ (1 − b).
+
+     Parameters are estimated via OLS regression of X_{t+1} on X_t over
+     the full price buffer (~500 ticks).  The signal is a z-score of the
+     deviation of the current price from the estimated long-run mean μ̂,
+     scaled by the regression residual standard deviation.
+
+     Positive z-score (price below μ̂) → long; negative → short.
+     This sub-signal acts as a contrarian anchor that pulls the composite
+     signal back toward equilibrium.
+
+
+3. COMPOSITE SIGNAL AGGREGATION
+--------------------------------------------------------------------------------
+The four sub-signals are combined with static weights:
+
+    composite = 0.25 × imbalance
+              + 0.30 × OFI
+              + 0.20 × flow_momentum
+              + 0.25 × mean_reversion
+
+The result is clamped to [-1, +1].
+
+The weights were chosen to balance two categories:
+  • Trend-following / momentum:  imbalance + OFI + flow  (total 0.75)
+  • Mean-reversion:              OU z-score              (total 0.25)
+
+This blends short-term momentum (what's happening right now at the top of
+book) with a longer-horizon anchor (where the price "should" be).
+
+
+4. CONFIDENCE GATING
+--------------------------------------------------------------------------------
+The model does NOT trade on the composite signal alone.  It also computes
+a confidence score:
+
+    confidence = agreement × vol_modifier × jump_filter
+
+4.1  Agreement (0 to 1)
+     Fraction of the four sub-signals that agree with the composite
+     direction.  For example, if composite > 0 and three of the four
+     sub-signals are also positive (> +0.05), agreement = 0.75.
+
+     Requiring high agreement prevents the model from acting on signals
+     driven by a single noisy sub-component.
+
+4.2  Volatility Modifier (0.3 to 1.5)
+     Ratio of long-run realised variance to short-run realised variance.
+
+       • > 1  →  market is quieter than usual  →  signals are more reliable
+                 → modifier amplifies confidence  (up to 1.5×)
+       • < 1  →  market is noisier than usual  →  signals are less reliable
+                 → modifier dampens confidence  (down to 0.3×)
+
+     Short-run RV uses the last 20 log-returns; long-run RV is the mean
+     of all short-run RV values seen (up to 200 samples).
+
+4.3  Jump Filter (0 or 1)
+     If the most recent log-return exceeds 3.5 standard deviations from
+     the rolling mean, a "jump" is flagged and the filter is set to 0
+     for 10 subsequent ticks.  This prevents the model from entering
+     during sudden price dislocations where the order book is likely
+     in a transient, unreliable state.
+
+An entry is only allowed when:
+  • |composite| ≥ entry_threshold    (default 0.35)
+  • confidence  ≥ confidence_threshold (default 0.60)
+
+This dual gate is the core mechanism for quality-over-quantity: the
+model will often see a signal but decline to trade because confidence
+is insufficient.
+
+
+5. RISK MANAGEMENT – ASYMMETRIC SL / TP
+--------------------------------------------------------------------------------
+Every position is bracketed with:
+
+    SL_distance = ATR × atr_sl_mult       (default 1.5)
+    TP_distance = SL_distance × risk_reward (default 2.5)
+
+where ATR is a simple rolling mean of |ΔPrice| over the last 100 ticks.
+
+For a LONG entry at price P:
+    stop-loss   = P − SL_distance
+    take-profit = P + TP_distance  =  P + 2.5 × SL_distance
+
+For a SHORT entry at price P:
+    stop-loss   = P + SL_distance
+    take-profit = P − TP_distance
+
+This means:
+  • The stop-loss is TIGHT (1.5 × ATR)
+  • The take-profit is WIDE (3.75 × ATR)
+  • Risk-reward ratio is 1 : 2.5
+
+Even if only 30-40% of trades are winners, the strategy can be
+profitable because each winner earns 2.5× what each loser costs.
+
+The position is exited immediately when the mid-price crosses either
+the SL or TP level.  After any exit (SL or TP), the cooldown timer
+resets, preventing immediate re-entry.
+
+
+6. COOLDOWN & TRADE FREQUENCY
+--------------------------------------------------------------------------------
+Minimum interval between trades: 30 seconds (configurable via cooldown_ms).
+
+This is 6× longer than the base strategies (5 s).  Combined with the
+confidence gate, the model typically produces 5-15× fewer trades than the
+simpler strategies, but each trade is backed by stronger evidence.
+
+
+7. THOUGHT PROCESS
+--------------------------------------------------------------------------------
+The model maintains a scrolling log of its reasoning:
+
+  • Every 20 book ticks: a full "analysis" dump showing all sub-signal
+    values, composite score, confidence, volatility regime, jump status,
+    position state, and distance to SL / TP (if in a position).
+
+  • On every entry decision:
+    - If skipped due to low confidence → logs reason
+    - If skipped due to jump → logs reason
+    - If entered → logs direction, entry price, SL, TP, signal, confidence
+
+  • On every exit: logs exit price, whether SL or TP was hit, and
+    the per-unit price delta.
+
+This log is displayed in real time on the dashboard, so you can observe
+exactly why the model is (or isn't) trading at any moment.
+
+
+8. PARAMETER SUMMARY
+--------------------------------------------------------------------------------
+Parameter                Default    Purpose
+─────────────────────    ───────    ──────────────────────────────────
+max_position             0.01       Maximum position size (BTC)
+cooldown_ms              30,000     Min ms between trades
+risk_reward              2.5        TP / SL ratio
+atr_sl_mult              1.5        SL = ATR × this
+entry_threshold          0.35       Min |composite| to consider entry
+confidence_threshold     0.60       Min confidence to allow entry
+analysis_every           20         Log full analysis every N ticks
+
+Sub-signal weights:
+  imbalance              0.25
+  OFI                    0.30
+  flow                   0.20
+  mean_reversion         0.25
+
+
+9. LIMITATIONS & FUTURE WORK
+--------------------------------------------------------------------------------
+• Weights are static.  An adaptive weighting scheme (e.g. online ridge
+  regression of sub-signals against realised returns) could improve
+  signal quality.
+
+• The confidence gate is rule-based.  A learned classifier (e.g. small
+  neural network predicting trade success from the feature vector) could
+  replace or augment it.
+
+• SL/TP levels are fixed at entry.  Trailing stops or dynamic bracket
+  adjustment based on post-entry order flow could improve risk management.
+
+• The model does not account for execution costs (spread, slippage, fees).
+  In live trading, the TP should be widened to cover round-trip costs.
+
+• Position sizing is binary (max_position or zero).  Kelly-criterion or
+  volatility-scaled sizing would be a natural extension.
+
+================================================================================
